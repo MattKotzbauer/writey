@@ -9,56 +9,179 @@ const GEMINI_API_KEY = "AIzaSyC7GdnlfOoHS5me82y-_vx9GmgeCW5Tqbk";
 const ADB_PATH = join(import.meta.dir, "platform-tools", "adb");
 const DCIM_PATH = "/sdcard/DCIM/Camera";
 const LOCAL_PHOTOS_DIR = join(import.meta.dir, "incoming_photos");
-const POLL_INTERVAL = 2000; // 2 seconds
+const POLL_INTERVAL = 2000;
+const WIRELESS_CONFIG_PATH = join(import.meta.dir, ".wireless_adb");
+const ADB_PORT = 5555;
 
-// Track when script started - only process photos taken AFTER this
 const SCRIPT_START_TIME = Date.now();
 
-// Ensure directories exist
 if (!existsSync(LOCAL_PHOTOS_DIR)) {
   mkdirSync(LOCAL_PHOTOS_DIR, { recursive: true });
 }
 
-// Track which photos we've already processed this session
 const processedThisSession = new Set<string>();
 
-// ADB helpers
+// Track current device target (set when wireless connects)
+let targetDevice: string | null = null;
+
+// ============== ADB Helpers ==============
+
 function adb(...args: string[]): string {
   try {
-    return execSync(`${ADB_PATH} ${args.join(" ")}`, { encoding: "utf-8" });
-  } catch (e: any) {
-    console.error(`ADB error: ${e.message}`);
+    const deviceArg = targetDevice ? `-s ${targetDevice}` : "";
+    return execSync(`${ADB_PATH} ${deviceArg} ${args.join(" ")}`, { encoding: "utf-8" });
+  } catch {
     return "";
+  }
+}
+
+function adbRaw(...args: string[]): string {
+  // ADB without device selection (for 'devices' command, etc.)
+  try {
+    return execSync(`${ADB_PATH} ${args.join(" ")}`, { encoding: "utf-8" });
+  } catch {
+    return "";
+  }
+}
+
+// ============== Wireless ADB ==============
+
+function getDeviceIp(): string | null {
+  try {
+    // Get IP from wlan0 interface
+    const output = adb("shell", "ip", "addr", "show", "wlan0");
+    const match = output.match(/inet (\d+\.\d+\.\d+\.\d+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWirelessConfig(ip: string): void {
+  writeFileSync(WIRELESS_CONFIG_PATH, ip);
+  console.log(`📝 Saved wireless config: ${ip}`);
+}
+
+function loadWirelessConfig(): string | null {
+  if (existsSync(WIRELESS_CONFIG_PATH)) {
+    return readFileSync(WIRELESS_CONFIG_PATH, "utf-8").trim();
+  }
+  return null;
+}
+
+function isWirelessConnected(): boolean {
+  const devices = adbRaw("devices");
+  return devices.includes(`:${ADB_PORT}\tdevice`);
+}
+
+function isUsbConnected(): boolean {
+  const devices = adbRaw("devices");
+  const lines = devices.split("\n").filter((l) => l.trim() && !l.startsWith("List"));
+  return lines.some((l) => l.includes("\tdevice") && !l.includes(`:${ADB_PORT}`));
+}
+
+function getUsbDevice(): string | null {
+  const devices = adbRaw("devices");
+  const lines = devices.split("\n").filter((l) => l.trim() && !l.startsWith("List"));
+  const usbLine = lines.find((l) => l.includes("\tdevice") && !l.includes(`:${ADB_PORT}`));
+  return usbLine ? usbLine.split("\t")[0] : null;
+}
+
+async function setupWirelessAdb(): Promise<boolean> {
+  console.log("\n🔌 Setting up wireless ADB...\n");
+
+  // Check if already connected wirelessly
+  if (isWirelessConnected()) {
+    const savedIp = loadWirelessConfig();
+    if (savedIp) {
+      targetDevice = `${savedIp}:${ADB_PORT}`;
+    }
+    console.log("✅ Already connected wirelessly");
+    return true;
+  }
+
+  // Try saved config first
+  const savedIp = loadWirelessConfig();
+  if (savedIp) {
+    console.log(`📡 Trying saved IP: ${savedIp}...`);
+    const result = adbRaw("connect", `${savedIp}:${ADB_PORT}`);
+    if (result.includes("connected")) {
+      targetDevice = `${savedIp}:${ADB_PORT}`;
+      console.log("✅ Connected wirelessly using saved config");
+      return true;
+    }
+    console.log("⚠️  Saved IP didn't work, need USB to reconfigure");
+  }
+
+  // Need USB to set up wireless
+  if (!isUsbConnected()) {
+    console.log("❌ No USB connection and no valid wireless config");
+    console.log("   Please connect via USB once to enable wireless mode");
+    return false;
+  }
+
+  // Target the USB device specifically for setup
+  const usbDevice = getUsbDevice();
+  if (usbDevice) {
+    targetDevice = usbDevice;
+  }
+
+  // Get device IP
+  const ip = getDeviceIp();
+  if (!ip) {
+    console.log("❌ Could not get device IP (is WiFi enabled on phone?)");
+    return false;
+  }
+
+  console.log(`📱 Device IP: ${ip}`);
+
+  // Enable TCP/IP mode
+  console.log("🔄 Enabling ADB over TCP/IP...");
+  const tcpResult = adb("tcpip", String(ADB_PORT));
+  console.log(`   ${tcpResult.trim() || "TCP/IP mode enabled"}`);
+
+  // Wait for device to restart ADB daemon
+  await new Promise((r) => setTimeout(r, 2000));
+
+  // Connect wirelessly
+  console.log(`🔗 Connecting to ${ip}:${ADB_PORT}...`);
+  const connectResult = adbRaw("connect", `${ip}:${ADB_PORT}`);
+
+  if (connectResult.includes("connected")) {
+    // Switch target to wireless device
+    targetDevice = `${ip}:${ADB_PORT}`;
+    console.log("✅ Connected wirelessly!");
+    saveWirelessConfig(ip);
+
+    console.log("\n📵 You can now disconnect the USB cable!\n");
+    return true;
+  } else {
+    console.log(`❌ Failed to connect: ${connectResult}`);
+    return false;
   }
 }
 
 interface PhotoInfo {
   path: string;
   filename: string;
-  timestamp: number; // Unix timestamp in ms
+  timestamp: number;
 }
 
 function getLatestPhotos(): PhotoInfo[] {
-  // Get the newest photos with timestamps using stat
-  // Wrap whole command in single quotes so shell doesn't mangle it
   try {
-    const cmd = `${ADB_PATH} shell 'stat -c "%n %Y" ${DCIM_PATH}/*.jpg 2>/dev/null | sort -k2 -rn | head -5'`;
+    const deviceArg = targetDevice ? `-s ${targetDevice}` : "";
+    const cmd = `${ADB_PATH} ${deviceArg} shell 'stat -c "%n %Y" ${DCIM_PATH}/*.jpg 2>/dev/null | sort -k2 -rn | head -5'`;
     const output = execSync(cmd, { encoding: "utf-8" });
-
     return output
       .split("\n")
       .filter(Boolean)
       .map((line) => {
         const parts = line.trim().split(" ");
-        const timestamp = parseInt(parts.pop() || "0", 10) * 1000; // Convert to ms
-        const path = parts.join(" "); // Handle spaces in filename
-        return {
-          path,
-          filename: basename(path),
-          timestamp,
-        };
+        const timestamp = parseInt(parts.pop() || "0", 10) * 1000;
+        const path = parts.join(" ");
+        return { path, filename: basename(path), timestamp };
       })
-      .filter(p => p.path && p.timestamp > 0);
+      .filter((p) => p.path && p.timestamp > 0);
   } catch {
     return [];
   }
@@ -66,14 +189,16 @@ function getLatestPhotos(): PhotoInfo[] {
 
 function pullPhoto(remotePath: string, localPath: string): boolean {
   try {
-    execSync(`${ADB_PATH} pull "${remotePath}" "${localPath}"`, { stdio: "pipe" });
+    const deviceArg = targetDevice ? `-s ${targetDevice}` : "";
+    execSync(`${ADB_PATH} ${deviceArg} pull "${remotePath}" "${localPath}"`, { stdio: "pipe" });
     return true;
   } catch {
     return false;
   }
 }
 
-// Transcribe image using Gemini Vision
+// ============== Gemini OCR ==============
+
 async function transcribeImage(imagePath: string): Promise<string> {
   console.log("📝 Transcribing with Gemini...");
 
@@ -85,110 +210,111 @@ async function transcribeImage(imagePath: string): Promise<string> {
   const mimeType = imagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
 
   const result = await model.generateContent([
-    {
-      inlineData: {
-        data: base64Image,
-        mimeType,
-      },
-    },
+    { inlineData: { data: base64Image, mimeType } },
     `You are an OCR system. Transcribe ALL handwritten text in this image EXACTLY as written.
-
-Rules:
-- Output ONLY the transcribed text
-- Preserve line breaks exactly as they appear
-- Preserve any formatting, indentation, or structure
-- Include all text, even if partially visible
-- Do not add any commentary, explanation, or markdown
-- Do not correct spelling or grammar
-- Just output the raw transcribed text`,
+Output ONLY the transcribed text, preserving line breaks and formatting.
+Do not add any commentary or markdown. Just the raw text.`,
   ]);
 
   return result.response.text().trim();
 }
 
-// Execute via Claude Code
-async function executeWithClaudeCode(transcribedText: string): Promise<void> {
-  console.log("\n" + "=".repeat(60));
+// ============== Claude Code Integration ==============
+
+let isFirstMessage = true;
+
+async function sendToClaude(text: string): Promise<void> {
+  console.log("\n" + "=".repeat(50));
   console.log("📋 TRANSCRIBED NOTE:");
-  console.log("=".repeat(60));
-  console.log(transcribedText);
-  console.log("=".repeat(60) + "\n");
+  console.log("=".repeat(50));
+  console.log(text);
+  console.log("=".repeat(50) + "\n");
 
-  console.log("🤖 Sending to Claude Code...\n");
-  console.log("-".repeat(60));
+  const args = ["--print"];
 
-  const systemPrompt = `This request was transcribed from a handwritten paper note. The user wrote this on paper and photographed it.
+  // Continue session for subsequent messages
+  if (!isFirstMessage) {
+    args.push("--continue");
+  }
 
-Key behaviors:
-- Execute the request as written
-- If there are any errors, explain them clearly and attempt to fix them
-- Show your work - let the developer see what you're doing
-- If the handwriting transcription seems unclear, make reasonable interpretations
-- After completing the task, briefly summarize what was done`;
-
-  // Run claude with the transcribed text and context
-  const claude = spawn("claude", [
-    "--print",
-    "--append-system-prompt", systemPrompt,
-    transcribedText
-  ], {
-    stdio: ["inherit", "inherit", "inherit"],
-    cwd: process.cwd(),
-  });
+  args.push(text);
 
   return new Promise((resolve, reject) => {
+    console.log("🤖 Sending to Claude Code" + (isFirstMessage ? "" : " (continuing session)") + "...\n");
+
+    const claude = spawn("claude", args, {
+      stdio: ["inherit", "inherit", "inherit"],
+      cwd: process.cwd(),
+    });
+
     claude.on("close", (code) => {
-      console.log("-".repeat(60));
+      isFirstMessage = false;
+      console.log("\n" + "-".repeat(50));
       if (code === 0) {
-        console.log("\n✅ Claude Code completed successfully\n");
+        console.log("✅ Claude completed\n");
       } else {
-        console.log(`\n⚠️  Claude Code exited with code ${code}\n`);
+        console.log(`⚠️  Claude exited with code ${code}\n`);
       }
       resolve();
     });
+
     claude.on("error", (err) => {
-      console.error("Failed to start Claude Code:", err.message);
+      console.error("Error:", err.message);
       reject(err);
     });
   });
 }
 
-// Main watcher loop
-async function watchForPhotos() {
+// ============== Main ==============
+
+async function main() {
+  const useWireless = process.argv.includes("--wireless") || process.argv.includes("-w");
+
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║           📱 Paper Note → Claude Code Bridge               ║
+║           📱 Paper Note → Claude Code                      ║
 ╠════════════════════════════════════════════════════════════╣
-║  1. Write your note on paper                               ║
-║  2. Take a photo with your Android phone                   ║
-║  3. The system will automatically:                         ║
-║     • Detect the new photo                                 ║
-║     • Transcribe your handwriting                          ║
-║     • Send instructions to Claude Code                     ║
+║  1. Write on paper, take photo with your phone             ║
+║  2. Gemini OCR transcribes the handwriting                 ║
+║  3. Claude Code executes (session persists via --continue) ║
+║  4. Bills to your Claude Code subscription                 ║
+╠════════════════════════════════════════════════════════════╣
+║  Mode: ${useWireless ? "📶 Wireless ADB" : "🔌 USB ADB"}                                     ║
+║  Tip: Run with --wireless or -w for wireless mode          ║
 ╚════════════════════════════════════════════════════════════╝
 `);
 
-  // Check device connection - look for a device line that ends with "device" (not "unauthorized")
-  const devices = adb("devices");
-  const deviceLines = devices.split("\n").filter(line => line.trim() && !line.startsWith("List"));
-  const authorizedDevice = deviceLines.find(line => line.includes("\tdevice"));
-
-  if (!authorizedDevice) {
-    const unauthorizedDevice = deviceLines.find(line => line.includes("unauthorized"));
-    if (unauthorizedDevice) {
-      console.error("❌ Android device found but NOT AUTHORIZED!");
-      console.error("   👉 Check your phone for a USB debugging prompt and tap 'Allow'\n");
-    } else {
-      console.error("❌ No Android device found!");
-      console.error("   Make sure:");
-      console.error("   1. USB debugging is enabled on your phone");
-      console.error("   2. Your phone is connected via USB\n");
+  // Set up connection (wireless or USB)
+  if (useWireless) {
+    const connected = await setupWirelessAdb();
+    if (!connected) {
+      process.exit(1);
     }
-    process.exit(1);
+  } else {
+    // Check USB device
+    const devices = adbRaw("devices");
+    const deviceLines = devices.split("\n").filter((line) => line.trim() && !line.startsWith("List"));
+    const authorizedDevice = deviceLines.find((line) => line.includes("\tdevice"));
+
+    if (!authorizedDevice) {
+      const unauthorized = deviceLines.find((line) => line.includes("unauthorized"));
+      if (unauthorized) {
+        console.error("❌ Device unauthorized - tap 'Allow' on your phone\n");
+      } else {
+        console.error("❌ No Android device found\n");
+      }
+      process.exit(1);
+    }
+
+    // In USB mode, set target device explicitly if multiple devices
+    const usbDevice = getUsbDevice();
+    if (usbDevice) {
+      targetDevice = usbDevice;
+    }
   }
 
-  console.log("✅ Android device connected\n");
-  console.log("👀 Watching for NEW photos (taken after script started)...\n");
+  console.log("✅ Android device connected");
+  console.log("👀 Watching for new photos...\n");
 
   let isProcessing = false;
 
@@ -199,19 +325,14 @@ async function watchForPhotos() {
     const photos = getLatestPhotos();
 
     for (const photo of photos) {
-      // Skip photos taken before script started
       if (photo.timestamp < SCRIPT_START_TIME) continue;
-
-      // Skip already processed
       if (processedThisSession.has(photo.filename)) continue;
 
-      // New photo detected!
       console.log(`\n📸 New photo detected: ${photo.filename}`);
       isProcessing = true;
       processedThisSession.add(photo.filename);
 
       try {
-        // Pull the photo
         const localPath = join(LOCAL_PHOTOS_DIR, photo.filename);
         console.log("⬇️  Pulling from device...");
 
@@ -220,32 +341,28 @@ async function watchForPhotos() {
           continue;
         }
 
-        // Transcribe
         const transcribedText = await transcribeImage(localPath);
 
         if (!transcribedText.trim()) {
-          console.log("⚠️  No text detected in image, skipping...");
+          console.log("⚠️  No text detected, skipping...");
           continue;
         }
 
-        // Execute with Claude Code
-        await executeWithClaudeCode(transcribedText);
+        await sendToClaude(transcribedText);
 
         console.log("👀 Watching for new photos...\n");
       } catch (err: any) {
-        console.error(`Error processing photo: ${err.message}`);
+        console.error(`Error: ${err.message}`);
       } finally {
         isProcessing = false;
       }
     }
   }, POLL_INTERVAL);
+
+  process.on("SIGINT", () => {
+    console.log("\n\n👋 Shutting down...");
+    process.exit(0);
+  });
 }
 
-// Handle graceful shutdown
-process.on("SIGINT", () => {
-  console.log("\n\n👋 Shutting down...\n");
-  process.exit(0);
-});
-
-// Start watching
-watchForPhotos();
+main();
