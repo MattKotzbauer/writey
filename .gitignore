@@ -1,40 +1,16 @@
-# dependencies (bun install)
-node_modules
+# Dependencies
+node_modules/
 
-# output
-out
-dist
-*.tgz
-
-# code coverage
-coverage
-*.lcov
-
-# logs
-logs
-_.log
-report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
-
-# dotenv environment variable files
-.env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
-
-# caches
-.eslintcache
-.cache
-*.tsbuildinfo
-
-# IntelliJ based IDEs
-.idea
-
-# Finder (MacOS) folder config
-.DS_Store
-
-# Note app specific
-incoming_photos/
-.processed_photos
-.current_note.txt
+# Platform tools (downloaded)
 platform-tools/
+
+# Runtime files
+incoming_photos/
+notes.md
+.wireless_adb
+
+# Bun
+bun.lockb
+
+# OS
+.DS_Store

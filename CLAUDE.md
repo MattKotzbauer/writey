@@ -1,4 +1,12 @@
 
+## Handwritten Notes (OCR)
+
+When reading notes from `notes.md` that were OCR'd from handwritten photos:
+- If the OCR text is jumbled or unclear, think contextually about what it could mean
+- After responding to a note, update `notes.md` with the corrected/interpreted content
+
+---
+
 Default to using Bun instead of Node.js.
 
 - Use `bun <file>` instead of `node <file>` or `ts-node <file>`

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-import { spawn, execSync } from "child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { execSync, spawnSync } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "fs";
 import { join, basename } from "path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
@@ -13,6 +13,14 @@ const POLL_INTERVAL = 2000;
 const WIRELESS_CONFIG_PATH = join(import.meta.dir, ".wireless_adb");
 const ADB_PORT = 5555;
 
+// Tmux config
+const TMUX_SOCKET = "paper-claude"; // Custom socket for isolation
+const TMUX_SESSION = "main";
+const NOTES_FILE = join(import.meta.dir, "notes.md");
+
+// Track which pane Claude is in
+let claudePane = "";
+
 const SCRIPT_START_TIME = Date.now();
 
 if (!existsSync(LOCAL_PHOTOS_DIR)) {
@@ -20,9 +28,8 @@ if (!existsSync(LOCAL_PHOTOS_DIR)) {
 }
 
 const processedThisSession = new Set<string>();
-
-// Track current device target (set when wireless connects)
 let targetDevice: string | null = null;
+let noteCounter = 0;
 
 // ============== ADB Helpers ==============
 
@@ -36,7 +43,6 @@ function adb(...args: string[]): string {
 }
 
 function adbRaw(...args: string[]): string {
-  // ADB without device selection (for 'devices' command, etc.)
   try {
     return execSync(`${ADB_PATH} ${args.join(" ")}`, { encoding: "utf-8" });
   } catch {
@@ -48,7 +54,6 @@ function adbRaw(...args: string[]): string {
 
 function getDeviceIp(): string | null {
   try {
-    // Get IP from wlan0 interface
     const output = adb("shell", "ip", "addr", "show", "wlan0");
     const match = output.match(/inet (\d+\.\d+\.\d+\.\d+)/);
     return match ? match[1] : null;
@@ -59,7 +64,6 @@ function getDeviceIp(): string | null {
 
 function saveWirelessConfig(ip: string): void {
   writeFileSync(WIRELESS_CONFIG_PATH, ip);
-  console.log(`📝 Saved wireless config: ${ip}`);
 }
 
 function loadWirelessConfig(): string | null {
@@ -88,9 +92,8 @@ function getUsbDevice(): string | null {
 }
 
 async function setupWirelessAdb(): Promise<boolean> {
-  console.log("\n🔌 Setting up wireless ADB...\n");
+  console.log("🔌 Setting up wireless ADB...");
 
-  // Check if already connected wirelessly
   if (isWirelessConnected()) {
     const savedIp = loadWirelessConfig();
     if (savedIp) {
@@ -100,66 +103,46 @@ async function setupWirelessAdb(): Promise<boolean> {
     return true;
   }
 
-  // Try saved config first
   const savedIp = loadWirelessConfig();
   if (savedIp) {
     console.log(`📡 Trying saved IP: ${savedIp}...`);
     const result = adbRaw("connect", `${savedIp}:${ADB_PORT}`);
     if (result.includes("connected")) {
       targetDevice = `${savedIp}:${ADB_PORT}`;
-      console.log("✅ Connected wirelessly using saved config");
+      console.log("✅ Connected wirelessly");
       return true;
     }
-    console.log("⚠️  Saved IP didn't work, need USB to reconfigure");
   }
 
-  // Need USB to set up wireless
   if (!isUsbConnected()) {
     console.log("❌ No USB connection and no valid wireless config");
-    console.log("   Please connect via USB once to enable wireless mode");
     return false;
   }
 
-  // Target the USB device specifically for setup
   const usbDevice = getUsbDevice();
-  if (usbDevice) {
-    targetDevice = usbDevice;
-  }
+  if (usbDevice) targetDevice = usbDevice;
 
-  // Get device IP
   const ip = getDeviceIp();
   if (!ip) {
-    console.log("❌ Could not get device IP (is WiFi enabled on phone?)");
+    console.log("❌ Could not get device IP");
     return false;
   }
 
   console.log(`📱 Device IP: ${ip}`);
-
-  // Enable TCP/IP mode
-  console.log("🔄 Enabling ADB over TCP/IP...");
-  const tcpResult = adb("tcpip", String(ADB_PORT));
-  console.log(`   ${tcpResult.trim() || "TCP/IP mode enabled"}`);
-
-  // Wait for device to restart ADB daemon
+  adb("tcpip", String(ADB_PORT));
   await new Promise((r) => setTimeout(r, 2000));
 
-  // Connect wirelessly
-  console.log(`🔗 Connecting to ${ip}:${ADB_PORT}...`);
   const connectResult = adbRaw("connect", `${ip}:${ADB_PORT}`);
-
   if (connectResult.includes("connected")) {
-    // Switch target to wireless device
     targetDevice = `${ip}:${ADB_PORT}`;
-    console.log("✅ Connected wirelessly!");
     saveWirelessConfig(ip);
-
-    console.log("\n📵 You can now disconnect the USB cable!\n");
+    console.log("✅ Connected wirelessly - you can disconnect USB");
     return true;
-  } else {
-    console.log(`❌ Failed to connect: ${connectResult}`);
-    return false;
   }
+  return false;
 }
+
+// ============== Photo Detection ==============
 
 interface PhotoInfo {
   path: string;
@@ -199,9 +182,7 @@ function pullPhoto(remotePath: string, localPath: string): boolean {
 
 // ============== Gemini OCR ==============
 
-async function transcribeImage(imagePath: string): Promise<string> {
-  console.log("📝 Transcribing with Gemini...");
-
+async function transcribeImage(imagePath: string, maxRetries = 3): Promise<string> {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
@@ -209,112 +190,234 @@ async function transcribeImage(imagePath: string): Promise<string> {
   const base64Image = imageData.toString("base64");
   const mimeType = imagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
 
-  const result = await model.generateContent([
-    { inlineData: { data: base64Image, mimeType } },
-    `You are an OCR system. Transcribe ALL handwritten text in this image EXACTLY as written.
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await model.generateContent([
+        { inlineData: { data: base64Image, mimeType } },
+        `You are an OCR system. Transcribe ALL handwritten text in this image EXACTLY as written.
 Output ONLY the transcribed text, preserving line breaks and formatting.
 Do not add any commentary or markdown. Just the raw text.`,
-  ]);
-
-  return result.response.text().trim();
+      ]);
+      return result.response.text().trim();
+    } catch (err: any) {
+      if (err.message?.includes("429") && attempt < maxRetries) {
+        const delay = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+        console.log(`⏳ Rate limited, retrying in ${delay / 1000}s...`);
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("Max retries exceeded");
 }
 
-// ============== Claude Code Integration ==============
+// ============== Tmux Helpers ==============
 
-let isFirstMessage = true;
+function tmux(...args: string[]): { ok: boolean; stdout: string; stderr: string } {
+  // All commands go through our custom socket
+  const result = spawnSync("tmux", ["-L", TMUX_SOCKET, ...args], { encoding: "utf-8" });
+  return {
+    ok: result.status === 0,
+    stdout: result.stdout?.toString() || "",
+    stderr: result.stderr?.toString() || "",
+  };
+}
 
-async function sendToClaude(text: string): Promise<void> {
-  console.log("\n" + "=".repeat(50));
-  console.log("📋 TRANSCRIBED NOTE:");
-  console.log("=".repeat(50));
-  console.log(text);
-  console.log("=".repeat(50) + "\n");
+function isInsideTmux(): boolean {
+  return !!process.env.TMUX;
+}
 
-  const args = ["--print"];
+function sessionExists(): boolean {
+  return tmux("has-session", "-t", TMUX_SESSION).ok;
+}
 
-  // Continue session for subsequent messages
-  if (!isFirstMessage) {
-    args.push("--continue");
+function setupTmuxAndRun(): void {
+  const insideTmux = isInsideTmux();
+  const watcherCmd = process.argv.includes("-w") || process.argv.includes("--wireless")
+    ? `bun run ${import.meta.dir}/index.ts --wireless --watcher-mode`
+    : `bun run ${import.meta.dir}/index.ts --watcher-mode`;
+
+  if (sessionExists()) {
+    console.log(`ℹ️  Session exists. Attaching...`);
+    attachAndSwitch(insideTmux);
+    process.exit(0);
   }
 
-  args.push(text);
+  // Create new session on our custom socket
+  console.log(`\n🖥️  Creating tmux session...`);
 
-  return new Promise((resolve, reject) => {
-    console.log("🤖 Sending to Claude Code" + (isFirstMessage ? "" : " (continuing session)") + "...\n");
+  tmux("new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50");
 
-    const claude = spawn("claude", args, {
-      stdio: ["inherit", "inherit", "inherit"],
-      cwd: process.cwd(),
-    });
+  // Get initial pane info
+  const paneInfo = tmux("list-panes", "-t", TMUX_SESSION, "-F", "#{window_index}.#{pane_index}");
+  const firstPane = paneInfo.stdout.trim() || "0.0";
+  const winIdx = firstPane.split(".")[0];
 
-    claude.on("close", (code) => {
-      isFirstMessage = false;
-      console.log("\n" + "-".repeat(50));
-      if (code === 0) {
-        console.log("✅ Claude completed\n");
-      } else {
-        console.log(`⚠️  Claude exited with code ${code}\n`);
-      }
-      resolve();
-    });
+  // Left pane (65%): Claude Code (with auto-accept permissions)
+  claudePane = `${TMUX_SESSION}:${firstPane}`;
+  tmux("send-keys", "-t", claudePane, `cd ${import.meta.dir} && claude --dangerously-skip-permissions`, "Enter");
 
-    claude.on("error", (err) => {
-      console.error("Error:", err.message);
-      reject(err);
-    });
-  });
+  // Split horizontally - right side (35%)
+  tmux("split-window", "-h", "-t", claudePane, "-p", "35");
+
+  // Get the right pane
+  let paneList = tmux("list-panes", "-t", TMUX_SESSION, "-F", "#{pane_index}").stdout.trim().split("\n");
+  const rightPane = paneList[paneList.length - 1];
+
+  // Top-right: nvim notes.md
+  const nvimPane = `${TMUX_SESSION}:${winIdx}.${rightPane}`;
+  tmux("send-keys", "-t", nvimPane, `nvim ${NOTES_FILE}`, "Enter");
+
+  // Split the right pane vertically - bottom for watcher (30% of right side)
+  tmux("split-window", "-v", "-t", nvimPane, "-p", "30");
+
+  // Get the new bottom-right pane
+  paneList = tmux("list-panes", "-t", TMUX_SESSION, "-F", "#{pane_index}").stdout.trim().split("\n");
+  const watcherPane = `${TMUX_SESSION}:${winIdx}.${paneList[paneList.length - 1]}`;
+
+  // Bottom-right: Watcher
+  tmux("send-keys", "-t", watcherPane, `cd ${import.meta.dir} && ${watcherCmd}`, "Enter");
+
+  // Focus Claude pane
+  tmux("select-pane", "-t", claudePane);
+
+  console.log(`✅ Created session`);
+  console.log(`   Left:         Claude Code`);
+  console.log(`   Top-right:    nvim notes.md`);
+  console.log(`   Bottom-right: Photo watcher\n`);
+
+  attachAndSwitch(insideTmux);
+  process.exit(0);
+}
+
+function attachAndSwitch(insideTmux: boolean): void {
+  if (insideTmux) {
+    // Already in tmux - create window and switch to it
+    spawnSync("tmux", ["new-window", "-n", "paper-claude"], { encoding: "utf-8" });
+    spawnSync("tmux", [
+      "send-keys", "-t", "paper-claude",
+      `TMUX= tmux -L ${TMUX_SOCKET} attach-session -t ${TMUX_SESSION}`,
+      "Enter"
+    ], { encoding: "utf-8" });
+    // Switch to the new window
+    spawnSync("tmux", ["select-window", "-t", "paper-claude"], { encoding: "utf-8" });
+    console.log(`✅ Switched to window 'paper-claude'`);
+  } else {
+    // Not in tmux - attach directly (replaces this process)
+    const { execSync } = require("child_process");
+    console.log(`📎 Attaching...`);
+    execSync(`tmux -L ${TMUX_SOCKET} attach -t ${TMUX_SESSION}`, { stdio: "inherit" });
+  }
+}
+
+function sendToClaude(message: string): void {
+  if (!claudePane) {
+    // Find Claude pane
+    const paneInfo = tmux("list-panes", "-t", TMUX_SESSION, "-F", "#{window_index}.#{pane_index}");
+    const panes = paneInfo.stdout.trim().split("\n");
+    claudePane = `${TMUX_SESSION}:${panes[0] || "0.0"}`;
+  }
+
+  // Use paste buffer (more reliable than send-keys for complex messages)
+  tmux("set-buffer", message);
+  tmux("paste-buffer", "-t", claudePane);
+  tmux("send-keys", "-t", claudePane, "Enter");
+}
+
+// ============== Notes Management ==============
+
+function initNotesFile(): void {
+  const header = `# Paper Notes → Claude Code
+
+This file is automatically updated when you take photos of handwritten notes.
+Claude Code can read this file to see your instructions.
+
+---
+
+`;
+  writeFileSync(NOTES_FILE, header);
+}
+
+function appendNote(text: string, photoFilename: string): void {
+  noteCounter++;
+  const timestamp = new Date().toLocaleTimeString();
+  const entry = `
+## Note #${noteCounter} (${timestamp})
+**Source:** ${photoFilename}
+
+\`\`\`
+${text}
+\`\`\`
+
+---
+`;
+  appendFileSync(NOTES_FILE, entry);
 }
 
 // ============== Main ==============
 
 async function main() {
   const useWireless = process.argv.includes("--wireless") || process.argv.includes("-w");
+  const isWatcherMode = process.argv.includes("--watcher-mode");
 
-  console.log(`
-╔════════════════════════════════════════════════════════════╗
-║           📱 Paper Note → Claude Code                      ║
-╠════════════════════════════════════════════════════════════╣
-║  1. Write on paper, take photo with your phone             ║
-║  2. Gemini OCR transcribes the handwriting                 ║
-║  3. Claude Code executes (session persists via --continue) ║
-║  4. Bills to your Claude Code subscription                 ║
-╠════════════════════════════════════════════════════════════╣
-║  Mode: ${useWireless ? "📶 Wireless ADB" : "🔌 USB ADB"}                                     ║
-║  Tip: Run with --wireless or -w for wireless mode          ║
-╚════════════════════════════════════════════════════════════╝
+  // If not in watcher mode, set up tmux and exit (watcher runs inside tmux)
+  if (!isWatcherMode) {
+    console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║         📱 Paper Note → Claude Code                           ║
+╚═══════════════════════════════════════════════════════════════╝
 `);
 
-  // Set up connection (wireless or USB)
+    // Quick ADB check before setting up tmux
+    if (useWireless) {
+      if (!(await setupWirelessAdb())) {
+        process.exit(1);
+      }
+    } else {
+      const devices = adbRaw("devices");
+      const hasDevice = devices.includes("\tdevice");
+      if (!hasDevice) {
+        console.error("❌ No Android device found. Connect via USB or use --wireless");
+        process.exit(1);
+      }
+    }
+    console.log("✅ Android device connected");
+
+    // Initialize notes file before tmux
+    initNotesFile();
+
+    // Set up tmux and switch to it (this exits the process)
+    setupTmuxAndRun();
+    return;
+  }
+
+  // === Watcher Mode (runs inside tmux pane) ===
+
+  console.log("📱 Photo Watcher Started\n");
+
+  // Set up ADB connection
   if (useWireless) {
-    const connected = await setupWirelessAdb();
-    if (!connected) {
+    if (!(await setupWirelessAdb())) {
       process.exit(1);
     }
   } else {
-    // Check USB device
     const devices = adbRaw("devices");
     const deviceLines = devices.split("\n").filter((line) => line.trim() && !line.startsWith("List"));
     const authorizedDevice = deviceLines.find((line) => line.includes("\tdevice"));
 
     if (!authorizedDevice) {
       const unauthorized = deviceLines.find((line) => line.includes("unauthorized"));
-      if (unauthorized) {
-        console.error("❌ Device unauthorized - tap 'Allow' on your phone\n");
-      } else {
-        console.error("❌ No Android device found\n");
-      }
+      console.error(unauthorized ? "❌ Device unauthorized" : "❌ No device");
       process.exit(1);
     }
 
-    // In USB mode, set target device explicitly if multiple devices
     const usbDevice = getUsbDevice();
-    if (usbDevice) {
-      targetDevice = usbDevice;
-    }
+    if (usbDevice) targetDevice = usbDevice;
   }
 
-  console.log("✅ Android device connected");
-  console.log("👀 Watching for new photos...\n");
+  console.log("✅ Device connected");
+  console.log("👀 Watching for photos...\n");
 
   let isProcessing = false;
 
@@ -328,7 +431,7 @@ async function main() {
       if (photo.timestamp < SCRIPT_START_TIME) continue;
       if (processedThisSession.has(photo.filename)) continue;
 
-      console.log(`\n📸 New photo detected: ${photo.filename}`);
+      console.log(`📸 New photo: ${photo.filename}`);
       isProcessing = true;
       processedThisSession.add(photo.filename);
 
@@ -341,16 +444,31 @@ async function main() {
           continue;
         }
 
+        console.log("📝 Transcribing...");
         const transcribedText = await transcribeImage(localPath);
 
         if (!transcribedText.trim()) {
-          console.log("⚠️  No text detected, skipping...");
+          console.log("⚠️  No text detected");
           continue;
         }
 
-        await sendToClaude(transcribedText);
+        console.log("✍️  Note transcribed:");
+        console.log("─".repeat(40));
+        console.log(transcribedText);
+        console.log("─".repeat(40));
 
-        console.log("👀 Watching for new photos...\n");
+        // Append to notes file
+        appendNote(transcribedText, photo.filename);
+        console.log(`📄 Added to ${NOTES_FILE}`);
+
+        // Notify Claude
+        if (sessionExists()) {
+          const notification = `[New handwritten note #${noteCounter} added to notes.md - please read and execute the instructions]`;
+          sendToClaude(notification);
+          console.log("🤖 Notified Claude Code");
+        }
+
+        console.log("");
       } catch (err: any) {
         console.error(`Error: ${err.message}`);
       } finally {
@@ -360,7 +478,7 @@ async function main() {
   }, POLL_INTERVAL);
 
   process.on("SIGINT", () => {
-    console.log("\n\n👋 Shutting down...");
+    console.log("\n👋 Watcher stopped");
     process.exit(0);
   });
 }
