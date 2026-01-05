@@ -2,41 +2,17 @@
 import { spawn, execSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, basename } from "path";
-import { homedir } from "os";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+const GEMINI_API_KEY = "AIzaSyC7GdnlfOoHS5me82y-_vx9GmgeCW5Tqbk";
 
 const ADB_PATH = join(import.meta.dir, "platform-tools", "adb");
 const DCIM_PATH = "/sdcard/DCIM/Camera";
 const LOCAL_PHOTOS_DIR = join(import.meta.dir, "incoming_photos");
 const POLL_INTERVAL = 2000; // 2 seconds
-const CLAUDE_CREDENTIALS_PATH = join(homedir(), ".claude", ".credentials.json");
 
 // Track when script started - only process photos taken AFTER this
 const SCRIPT_START_TIME = Date.now();
-
-// Load Claude Code's OAuth credentials
-function getClaudeAuthToken(): string {
-  try {
-    const creds = JSON.parse(readFileSync(CLAUDE_CREDENTIALS_PATH, "utf-8"));
-    const oauth = creds.claudeAiOauth;
-
-    if (!oauth?.accessToken) {
-      throw new Error("No access token found");
-    }
-
-    // Check if token is expired
-    if (oauth.expiresAt && oauth.expiresAt < Date.now()) {
-      throw new Error("Token expired - please run 'claude' to refresh");
-    }
-
-    return oauth.accessToken;
-  } catch (err: any) {
-    if (err.code === "ENOENT") {
-      throw new Error("Claude Code credentials not found. Please run 'claude' first to authenticate.");
-    }
-    throw err;
-  }
-}
 
 // Ensure directories exist
 if (!existsSync(LOCAL_PHOTOS_DIR)) {
@@ -97,45 +73,37 @@ function pullPhoto(remotePath: string, localPath: string): boolean {
   }
 }
 
-// Transcribe image using Anthropic SDK with Claude Code's auth
-async function transcribeImage(imagePath: string, authToken: string): Promise<string> {
-  console.log("📝 Transcribing handwritten note...");
+// Transcribe image using Gemini Vision
+async function transcribeImage(imagePath: string): Promise<string> {
+  console.log("📝 Transcribing with Gemini...");
 
-  const client = new Anthropic({ authToken });
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
   const imageData = readFileSync(imagePath);
   const base64Image = imageData.toString("base64");
-  const mediaType = imagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+  const mimeType = imagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 4096,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: mediaType,
-              data: base64Image,
-            },
-          },
-          {
-            type: "text",
-            text: `Transcribe this handwritten note EXACTLY as written. The note likely contains instructions for a coding assistant.
-
-Output ONLY the transcribed text, preserving line breaks, formatting, and any technical notation.
-Do not add commentary or markdown formatting. Just the raw transcribed text.`,
-          },
-        ],
+  const result = await model.generateContent([
+    {
+      inlineData: {
+        data: base64Image,
+        mimeType,
       },
-    ],
-  });
+    },
+    `You are an OCR system. Transcribe ALL handwritten text in this image EXACTLY as written.
 
-  const textContent = response.content.find((c) => c.type === "text");
-  return textContent?.text || "";
+Rules:
+- Output ONLY the transcribed text
+- Preserve line breaks exactly as they appear
+- Preserve any formatting, indentation, or structure
+- Include all text, even if partially visible
+- Do not add any commentary, explanation, or markdown
+- Do not correct spelling or grammar
+- Just output the raw transcribed text`,
+  ]);
+
+  return result.response.text().trim();
 }
 
 // Execute via Claude Code
@@ -200,16 +168,6 @@ async function watchForPhotos() {
 ╚════════════════════════════════════════════════════════════╝
 `);
 
-  // Get Claude Code's auth token
-  let authToken: string;
-  try {
-    authToken = getClaudeAuthToken();
-    console.log("✅ Using Claude Code authentication\n");
-  } catch (err: any) {
-    console.error(`❌ ${err.message}\n`);
-    process.exit(1);
-  }
-
   // Check device connection - look for a device line that ends with "device" (not "unauthorized")
   const devices = adb("devices");
   const deviceLines = devices.split("\n").filter(line => line.trim() && !line.startsWith("List"));
@@ -263,7 +221,7 @@ async function watchForPhotos() {
         }
 
         // Transcribe
-        const transcribedText = await transcribeImage(localPath, authToken);
+        const transcribedText = await transcribeImage(localPath);
 
         if (!transcribedText.trim()) {
           console.log("⚠️  No text detected in image, skipping...");
